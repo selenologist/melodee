@@ -7,18 +7,22 @@ static int16_t *cho_buf;
 #define REV_COMB_LEN (1116u + 1188u + 1277u + 1356u)
 static const uint16_t REV_COMB[4] = {1116, 1188, 1277, 1356};
 static const uint16_t REV_AP[2] = {556, 441};
-static int16_t *rev_comb;
+static int16_t *rev_comb;                /* the line's high 16 bits (SPRING's and HALL's whole line) */
+static uint8_t *rev_comb_lo;             /* ROOM's low 8 bits: its 24-bit Q15.6 store, see rev_room */
+#define REV_COMB_PLANE ((REV_COMB_LEN * 2u + 3u) & ~3u)
+#define REV_LO_PLANE ((REV_COMB_LEN + 3u) & ~3u)
 typedef union {                          /* ROOM's allpasses; SPRING's allpass chain (int32: no clamps) */
     int16_t ap[556 + 441];
     int32_t sp[(556 + 441) / 2];
 } rev_memory_t;
 static rev_memory_t *rev_memory;
 #define rev_u (*rev_memory)
-#define REV_MEMORY_BYTES (((REV_COMB_LEN * 2u + 3u) & ~3u) + sizeof(rev_memory_t))
+#define REV_MEMORY_BYTES (REV_COMB_PLANE + REV_LO_PLANE + sizeof(rev_memory_t))
 static uint32_t cho_idle, rev_scan;
 /* ROOM has small integer DC fixed points. Preserve them in six values when
  * its delay lines become constant; releasing them must not alter later audio. */
-static int16_t rev_hold_comb[4], rev_hold_ap[2];
+static int32_t rev_hold_comb[4];         /* ROOM's lines at rest: the 24-bit value of each */
+static int16_t rev_hold_ap[2];
 static int32_t rev_hold_dc;
 static int16_t rev_hold_size, rev_hold_damp;
 #define rev_ap (rev_u.ap)
@@ -106,10 +110,16 @@ static int reverb_prepare(void)
 {
     if (!rev_comb) {
         rev_comb = resource_get(RES_REVERB, REV_MEMORY_BYTES);
-        if (rev_comb) rev_memory = (rev_memory_t *)((uint8_t *)rev_comb + ((REV_COMB_LEN * 2u + 3u) & ~3u));
+        if (rev_comb) {
+            rev_comb_lo = (uint8_t *)rev_comb + REV_COMB_PLANE;
+            rev_memory = (rev_memory_t *)((uint8_t *)rev_comb + REV_COMB_PLANE + REV_LO_PLANE);
+        }
         if(rev_comb){
             uint32_t off=0;
-            for(uint32_t k=0;k<4u;k++)for(uint32_t j=0;j<REV_COMB[k];j++)rev_comb[off++]=rev_hold_comb[k];
+            for(uint32_t k=0;k<4u;k++)for(uint32_t j=0;j<REV_COMB[k];j++,off++){
+                rev_comb[off]=(int16_t)(rev_hold_comb[k]>>8);
+                rev_comb_lo[off]=(uint8_t)rev_hold_comb[k];
+            }
             off=0;
             for(uint32_t k=0;k<2u;k++)for(uint32_t j=0;j<REV_AP[k];j++)rev_ap[off++]=rev_hold_ap[k];
         }
@@ -254,40 +264,69 @@ static uint32_t seq_div_samples(uint32_t div)
 #include "perform.c"                                 /* the FX hold layer's effects (the master) */
 #include "delay.c"                                   /* the delay bus: x0x's tape delay */
 
-/* ROOM (G_RTYPE 0): 4 damped combs + 2 allpasses (Freeverb-like, mono), added to out */
+/* ROOM (G_RTYPE 0): 4 damped combs + 2 allpasses (Freeverb-like, mono), added to out.
+ *
+ * The comb line keeps the loop's value at higher precision than 16 bits: a 16-bit plane and a
+ * byte plane, read and written as one 24-bit Q15.6 word.  One LSB of a 16-bit line is an
+ * ABSOLUTE step (-90.3 dBFS): as the tail decays the error stays put while the signal shrinks
+ * beneath it, so the granulation grows relative to what you hear, and at low DAMP the residual
+ * holds the loop open as a limit cycle.  Keeping the damping's fraction (the (int64_t) multiply)
+ * leaves the line as the comb's only quantiser, and the x2 send puts the stored signal up where
+ * the line's LSB is a finer relative step.  SPRING and HALL read the same memory as an int16
+ * line and are untouched.
+ *
+ * The allpass stays 16-bit -- see its own note -- so it runs at twice its old scale (the
+ * conversion at its stores), which is what keeps the two stages' signals commensurate.
+ *
+ * Measured (host build, single C5 tap, SIZE 100 %): DAMP 100 tail 1.9 s -> 4.7 s to exact
+ * silence; DAMP 30 a -90.3 dBFS limit cycle that never ended -> exact silence. */
+#define REV_LP_SHIFT 14                  /* the ROOM line and comb_lp are Q15.14 */
 static __attribute__((noinline)) void rev_room(const int32_t *rev_in, int32_t *out, uint32_t n,
-                                               int16_t *restrict comb, int16_t *restrict aps)
+                                               int16_t *restrict comb, uint8_t *restrict comb_lo,
+                                               int16_t *restrict aps)
 {
     uint32_t i, k;
     int32_t size = 25000 + song.g[G_RSIZE] * 50, damp = 32767 - song.g[G_RDAMP] * 200;
     for (i = 0; i < n; i++) {
         int32_t a = 0;
-        int16_t *c = comb;
-        int32_t in = mulq15(rev_in[i], 2580);           /* 1/8 at -4 dB: level as before the allpass fix */
+        int16_t *ch = comb;
+        uint8_t *clo = comb_lo;
+        int32_t in = mulq15(rev_in[i], 5160);           /* the loop runs x2: unit scale, 1/4 */
         for (k = 0; k < 4u; k++) {
-            int32_t o = c[fx.comb_i[k]];
-            fx.comb_lp[k] = o + mulq15(fx.comb_lp[k] - o, 32767 - damp);
-            c[fx.comb_i[k]] = (int16_t)clamp(in + mulq15(fx.comb_lp[k], size), -32768, 32767);
+            int32_t o = (((int32_t)ch[fx.comb_i[k]] << 8) | (clo[fx.comb_i[k]] & 0xFF)) << 8;
+            int64_t prod;
+            fx.comb_lp[k] = o + (int32_t)((((int64_t)(fx.comb_lp[k] - o)) * (32767 - damp)) >> 15);
+            prod = (int64_t)fx.comb_lp[k] * size;
+            {
+                int32_t q = (int32_t)(prod >> 15);
+                int32_t v24 = ((in << REV_LP_SHIFT) + q) >> 8;
+                ch[fx.comb_i[k]] = (int16_t)(v24 >> 8);
+                clo[fx.comb_i[k]] = (uint8_t)(v24 & 0xFF);
+            }
             if (++fx.comb_i[k] >= REV_COMB[k])
                 fx.comb_i[k] = 0;
             a += o;
-            c += REV_COMB[k];
+            ch += REV_COMB[k];
+            clo += REV_COMB[k];
         }
-        c = aps;
-        for (k = 0; k < 2u; k++) {
-            int32_t o = c[fx.ap_i[k]];
-            int32_t v = a + (o >> 1);
-            c[fx.ap_i[k]] = (int16_t)clamp(v, -32768, 32767);
-            a = o - a;                                  /* Freeverb: out = buf - in (o - v is a notch comb) */
-            if (++fx.ap_i[k] >= REV_AP[k])
-                fx.ap_i[k] = 0;
-            c += REV_AP[k];
+        {   int16_t *c = aps;                           /* the allpass stays 16-bit: its
+                                                         * truncation is the loss that lets the
+                                                         * loop reach exact silence */
+            for (k = 0; k < 2u; k++) {
+                int32_t o = c[fx.ap_i[k]] << REV_LP_SHIFT;
+                int32_t v = a + (o >> 1);
+                c[fx.ap_i[k]] = (int16_t)clamp(v >> REV_LP_SHIFT, -32768, 32767);
+                a = o - a;                              /* Freeverb: out = buf - in (o - v is a notch comb) */
+                if (++fx.ap_i[k] >= REV_AP[k])
+                    fx.ap_i[k] = 0;
+                c += REV_AP[k];
+            }
         }
-        out[i] += a;
+        out[i] += a >> 15;
     }
 }
 
-#define rev_room(in,out,n) (rev_room)((in),(out),(n),rev_comb,rev_ap)
+#define rev_room(in,out,n) (rev_room)((in),(out),(n),rev_comb,rev_comb_lo,rev_ap)
 
 /* SPRING (see the top), added to out */
 static __attribute__((noinline)) void rev_spring(const int32_t *rev_in, int32_t *out, uint32_t n,
@@ -519,8 +558,10 @@ static void rev_clear(void)
     hl.x = hl.m = hl.s = hl.hp = hl.he = 0;
     memset(rev_hold_comb,0,sizeof rev_hold_comb);memset(rev_hold_ap,0,sizeof rev_hold_ap);
     uint32_t i;
-    for (i = 0; i < REV_COMB_LEN; i++)
+    for (i = 0; i < REV_COMB_LEN; i++) {
         rev_comb[i] = 0;
+        rev_comb_lo[i] = 0;
+    }
     for (i = 0; i < sizeof rev_u.ap / 2u; i++)
         rev_u.ap[i] = 0;
     for (i = 0; i < 4u; i++)
@@ -533,11 +574,11 @@ static void rev_clear(void)
  * line before processing. SPRING is suspended only at exact zero. */
 static int reverb_suspend(uint32_t rt)
 {
-    int16_t comb[4]={0}, ap[2]={0};int32_t dc=0;
+    int32_t comb[4]={0};int16_t ap[2]={0};int32_t dc=0;
     if (rt == 2u) {
         if (hl.x || hl.m || hl.s || hl.hp) return 0;
         for (uint32_t k=0;k<HL_NL;k++) if (hl.lp[k]) return 0;
-        for (uint32_t k=0;k<REV_COMB_LEN;k++) if (rev_comb[k]) return 0;
+        for (uint32_t k=0;k<REV_COMB_LEN;k++) if (rev_comb[k] || rev_comb_lo[k]) return 0;
         for (uint32_t k=0;k<sizeof rev_u.ap/2u;k++) if (rev_u.ap[k]) return 0;
     } else if(rt){
         /* -1 is a silent fixed point of the integer low-pass: its update
@@ -547,32 +588,42 @@ static int reverb_suspend(uint32_t rt)
         const uint32_t *words=(const uint32_t *)rev_comb;
         for(uint32_t j=0;j<REV_MEMORY_BYTES/4u;j++)if(words[j])return 0;
     }else{
-        uint32_t off=0;int32_t gain=25000+song.g[G_RSIZE]*50;
+        uint32_t off=0;int32_t a=0,size=25000+song.g[G_RSIZE]*50,damp=32767-song.g[G_RDAMP]*200;
         for(uint32_t k=0;k<4u;k++){
-            comb[k]=rev_comb[off];
-            if(fx.comb_lp[k]!=comb[k] || mulq15(comb[k],gain)!=comb[k])return 0;
-            for(uint32_t j=0;j<REV_COMB[k];j++)if(rev_comb[off++]!=comb[k])return 0;
-            dc+=comb[k];
+            int32_t s=(int32_t)(((uint32_t)rev_comb[off]<<8)|rev_comb_lo[off]);
+            /* the line is one constant 24-bit word, and one turn of the loop from that state
+             * reproduces it (its low-pass and its store both at rest) */
+            for(uint32_t j=0;j<REV_COMB[k];j++){
+                if(rev_comb[off]!=(int16_t)(s>>8) || rev_comb_lo[off]!=(uint8_t)s)return 0;
+                off++;
+            }
+            int32_t o=s<<8;
+            int32_t l=o+(int32_t)(((int64_t)(fx.comb_lp[k]-o)*(32767-damp))>>15);
+            if(l!=fx.comb_lp[k] || ((int32_t)(((int64_t)l*size)>>15)>>8)!=s)return 0;
+            comb[k]=s;
+            a+=o;
         }
         off=0;
         for(uint32_t k=0;k<2u;k++){
             ap[k]=rev_ap[off];
-            /* Arithmetic shifts can leave isolated -1 samples circulating
+            /* Arithmetic shifts can leave isolated samples circulating
              * forever after the combs reach zero. At most two output counts:
              * discard this quantization residue rather than retain a buffer. */
-            if(!dc){
+            if(!a){
                 uint32_t j=0;
-                for(;j<REV_AP[k] && rev_ap[off+j]>=-1 && rev_ap[off+j]<=1;j++) {}
+                for(;j<REV_AP[k] && rev_ap[off+j]>=-2 && rev_ap[off+j]<=2;j++) {}
                 if(j==REV_AP[k]){off+=REV_AP[k];ap[k]=0;continue;}
             }
-            if(dc+(ap[k]>>1)!=ap[k])return 0;
+            int32_t o=(int32_t)ap[k]<<REV_LP_SHIFT;
+            if(((a+(o>>1))>>REV_LP_SHIFT)!=ap[k])return 0;
             for(uint32_t j=0;j<REV_AP[k];j++)if(rev_ap[off++]!=ap[k])return 0;
-            dc=ap[k]-dc;
+            a=o-a;
         }
+        dc=a>>15;
     }
     memcpy(rev_hold_comb,comb,sizeof comb);memcpy(rev_hold_ap,ap,sizeof ap);rev_hold_dc=dc;
     rev_hold_size=song.g[G_RSIZE];rev_hold_damp=song.g[G_RDAMP];
-    resource_release(RES_REVERB);rev_comb=0;rev_memory=0;return 1;
+    resource_release(RES_REVERB);rev_comb=0;rev_comb_lo=0;rev_memory=0;return 1;
 }
 
 static void reverb_idle_clock(uint32_t rt,uint32_t n)

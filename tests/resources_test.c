@@ -6,7 +6,7 @@
 static void audio_resources_reset(void)
 {
     upf_release();memset(resource,0,sizeof resource);memset(sl_buf,0,sizeof sl_buf);
-    cho_buf=rev_comb=perf_audio=0;rev_memory=0;sl_lent=0;
+    cho_buf=rev_comb=perf_audio=0;rev_comb_lo=0;rev_memory=0;sl_lent=0;
     memset(&fx,0,sizeof fx);memset(sl,0,sizeof sl);
     memset(rev_hold_comb,0,sizeof rev_hold_comb);memset(rev_hold_ap,0,sizeof rev_hold_ap);
     rev_hold_dc=0;cho_idle=rev_scan=0;pf.mode=BM_NONE;pf.src=pf.next=PF_N;pf.w=0;
@@ -82,7 +82,7 @@ static int audio_tests(void)
     for(uint32_t t=0;t<30u*FS;t+=CTL){fx_buses(c,d,r,out,CTL);for(uint32_t j=0;j<CTL;j++)spring_tail |= out[j];}
     bad+=check("SPRING keeps its audible tail then releases storage",spring_tail && !resource[RES_REVERB].size);
     reverb_prepare();__typeof__(fx) spring_saved=fx;int32_t spring_ref[CTL]={0};r[0]=10000;
-    rev_spring(r,spring_ref,CTL);fx=spring_saved;resource_release(RES_REVERB);rev_comb=0;rev_memory=0;
+    rev_spring(r,spring_ref,CTL);fx=spring_saved;resource_release(RES_REVERB);rev_comb=0;rev_comb_lo=0;rev_memory=0;
     fx_buses(c,d,r,out,CTL);r[0]=0;
     bad+=check("SPRING resumes with its exact filter and modulation state",!memcmp(spring_ref,out,sizeof spring_ref));
     for(uint32_t t=0;t<30u*FS;t+=CTL)fx_buses(c,d,r,out,CTL);
@@ -92,18 +92,20 @@ static int audio_tests(void)
     for(uint32_t t=0;t<30u*FS;t+=CTL){fx_buses(c,d,r,out,CTL);for(uint32_t j=0;j<CTL;j++)hall_tail |= out[j] | (hl.side?rev_side[j]:0);}
     bad+=check("HALL keeps its audible stereo tail then releases storage",hall_tail && !resource[RES_REVERB].size && !hl.side);
     reverb_prepare();__typeof__(hl) hall_saved=hl;int32_t hall_ref[CTL]={0},hall_sd[CTL];r[0]=10000;
-    rev_hall(r,hall_ref,CTL);memcpy(hall_sd,rev_side,sizeof hall_sd);hl=hall_saved;resource_release(RES_REVERB);rev_comb=0;rev_memory=0;
+    rev_hall(r,hall_ref,CTL);memcpy(hall_sd,rev_side,sizeof hall_sd);hl=hall_saved;resource_release(RES_REVERB);rev_comb=0;rev_comb_lo=0;rev_memory=0;
     fx_buses(c,d,r,out,CTL);r[0]=0;
     bad+=check("HALL resumes with its exact line positions and filter state",!memcmp(hall_ref,out,sizeof hall_ref) && hl.side && !memcmp(hall_sd,rev_side,sizeof hall_sd));
     for(uint32_t t=0;t<30u*FS;t+=CTL)fx_buses(c,d,r,out,CTL);
     song.g[G_RTYPE]=0;fx_buses(c,d,r,out,CTL);reverb_prepare();
     uint32_t off=0;
-    for(uint32_t k=0;k<4u;k++){fx.comb_lp[k]=-2;for(uint32_t j=0;j<REV_COMB[k];j++)rev_comb[off++]=-2;}
-    off=0;for(uint32_t k=0;k<2u;k++)for(uint32_t j=0;j<REV_AP[k];j++)rev_ap[off++]=-16;
+    /* A constant tail of the 24-bit ROOM line: -10 per comb (its own store and low-pass at rest)
+       and the allpasses' -2 / -3. It is the loop's fixed point, and it is worth one output count. */
+    for(uint32_t k=0;k<4u;k++){fx.comb_lp[k]=-2560;for(uint32_t j=0;j<REV_COMB[k];j++,off++){rev_comb[off]=-1;rev_comb_lo[off]=246;}}
+    off=0;for(uint32_t k=0;k<2u;k++){int16_t v=(int16_t)(k?-3:-2);for(uint32_t j=0;j<REV_AP[k];j++)rev_ap[off++]=v;}
     for(uint32_t t=0;t<2u*FS;t+=CTL)fx_buses(c,d,r,out,CTL);
-    bad+=check("ROOM constant tail is represented exactly after release",!resource[RES_REVERB].size && rev_hold_dc==-8 && out[0]==-8);
+    bad+=check("ROOM constant tail is represented exactly after release",!resource[RES_REVERB].size && rev_hold_dc==-1 && out[0]==-1);
     reverb_prepare();__typeof__(fx) saved=fx;int32_t ref[CTL]={0};r[0]=10000;
-    rev_room(r,ref,CTL);fx=saved;resource_release(RES_REVERB);rev_comb=0;rev_memory=0;
+    rev_room(r,ref,CTL);fx=saved;resource_release(RES_REVERB);rev_comb=0;rev_comb_lo=0;rev_memory=0;
     fx_buses(c,d,r,out,CTL);r[0]=0;
     bad+=check("new send restores the previous tail byte for byte",!memcmp(ref,out,sizeof ref));
     bad+=check("capacity exhaustion returns failure and preserves live memory",resource_get(RES_ENGINE0,RESOURCE_CAPACITY+4u)==0 && resource[RES_ENGINE0].size==largest);

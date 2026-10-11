@@ -2,9 +2,9 @@
  * Copyright (C) 2026 Leo Kuroshita (@kurogedelic), Hügelton Instruments */
 /* The reverb bus's two models (src/fx.c: REVERB TYPE, G_RTYPE) on the Mac, through hostsim.c as regress.c.
  *   build/host/reverb_test [DEMODIR]          (run_tests.sh: build/fx_demo)
- * 1. ROOM bit-identical: fx_buses against a copy of the buses as they were before SPRING (chorus, delay and the
- *    4-comb room in one loop), on noise sends with SIZE / DAMP / the delay and chorus settings changing, sample
- *    for sample. (The goldens of regress.c, all rendered with ROOM, say the same for the whole mix.)
+ * 1. ROOM: fx_buses against an independent copy of the buses (chorus, delay and the 4-comb room in
+ *    one loop), on noise sends with SIZE / DAMP / the delay and chorus settings changing, sample
+ *    for sample. (The goldens of regress.c, all rendered with ROOM, cover the whole mix.)
  * 2. SPRING decay: the impulse response's RT60 (Schroeder integral, -5 .. -35 dB) rises with SIZE, within
  *    0.15 .. 1 s at SIZE 0 and 2 .. 6 s at 127.
  * 3. SPRING dispersion: the group delay of the first arrival rises with frequency (1 .. 5 kHz, each band later
@@ -52,8 +52,9 @@ static int32_t noise(int32_t amp)
     return (int32_t)(((int64_t)(int32_t)xs * amp) >> 31);
 }
 
-/* ------------------------------------------------- the buses before SPRING --- */
+/* ------------------------------------------------- the buses' reference --- */
 static int16_t ref_cho[CHO_LEN], ref_comb[1116 + 1188 + 1277 + 1356], ref_ap[556 + 441];
+static uint8_t ref_comb_lo[1116 + 1188 + 1277 + 1356];
 static struct {
     uint32_t cho_w, cho_ph;
     uint16_t comb_i[4], ap_i[2];
@@ -78,30 +79,41 @@ static void ref_buses(const int32_t *cho_in, const int32_t *rev_in, int32_t *wet
         }
         rf.cho_w++;
         a = 0;
-        {
-            int16_t *c = ref_comb;
-            int32_t in = mulq15(rev_in[i], 2580);
+        {   /* the same 24-bit ROOM line as src/fx.c (see rev_room there) */
+            int16_t *ch = ref_comb;
+            uint8_t *clo = ref_comb_lo;
+            int32_t in = mulq15(rev_in[i], 5160);
             for (k = 0; k < 4u; k++) {
-                int32_t o = c[rf.comb_i[k]];
-                rf.comb_lp[k] = o + mulq15(rf.comb_lp[k] - o, 32767 - damp);
-                c[rf.comb_i[k]] = (int16_t)clamp(in + mulq15(rf.comb_lp[k], size), -32768, 32767);
+                int32_t o = (((int32_t)ch[rf.comb_i[k]] << 8) | (clo[rf.comb_i[k]] & 0xFF)) << 8;
+                int64_t prod;
+                rf.comb_lp[k] = o + (int32_t)((((int64_t)(rf.comb_lp[k] - o)) * (32767 - damp)) >> 15);
+                prod = (int64_t)rf.comb_lp[k] * size;
+                {
+                    int32_t q = (int32_t)(prod >> 15);
+                    int32_t v24 = ((in << REV_LP_SHIFT) + q) >> 8;
+                    ch[rf.comb_i[k]] = (int16_t)(v24 >> 8);
+                    clo[rf.comb_i[k]] = (uint8_t)(v24 & 0xFF);
+                }
                 if (++rf.comb_i[k] >= REV_COMB[k])
                     rf.comb_i[k] = 0;
                 a += o;
-                c += REV_COMB[k];
+                ch += REV_COMB[k];
+                clo += REV_COMB[k];
             }
-            c = ref_ap;
+        }
+        {
+            int16_t *c = ref_ap;
             for (k = 0; k < 2u; k++) {
-                int32_t o = c[rf.ap_i[k]];
+                int32_t o = c[rf.ap_i[k]] << REV_LP_SHIFT;
                 int32_t v = a + (o >> 1);
-                c[rf.ap_i[k]] = (int16_t)clamp(v, -32768, 32767);
+                c[rf.ap_i[k]] = (int16_t)clamp(v >> REV_LP_SHIFT, -32768, 32767);
                 a = o - a;
                 if (++rf.ap_i[k] >= REV_AP[k])
                     rf.ap_i[k] = 0;
                 c += REV_AP[k];
             }
         }
-        y += a;
+        y += a >> 15;
         wet[i] = y;
     }
 }
@@ -130,7 +142,7 @@ static void test_room_identical(void)
         for (i = 0; i < CTL; i++)
             diff += w0[i] != w1[i];
     }
-    check("ROOM: the buses bit for bit as before SPRING (30 s of noise sends, settings changing)", !diff && !fx.rtype);
+    check("ROOM: the whole bus (chorus, the 4-comb ROOM) matches the reference, sample for sample", !diff && !fx.rtype);
 }
 
 /* ------------------------------------------------------------- SPRING --- */
